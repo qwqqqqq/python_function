@@ -1,0 +1,618 @@
+soltrade.py
+
+from soltrade.wallet import find_balance
+from soltrade.config import config
+from soltrade.trading import start_trading
+from soltrade.log import log_general
+
+
+# Initialize configuration
+config_path = 'config.json'
+config(config_path)
+
+
+def check_json_state():
+    if config().keypair and config().other_mint:
+        return True
+    return False
+
+# Prints "Soltrade" and information about the connected wallet
+print("""                    $$\   $$\                              $$\           
+                    $$ |  $$ |                             $$ |          
+ $$$$$$$\  $$$$$$\  $$ |$$$$$$\    $$$$$$\  $$$$$$\   $$$$$$$ | $$$$$$\  
+$$  _____|$$  __$$\ $$ |\_$$  _|  $$  __$$\ \____$$\ $$  __$$ |$$  __$$\ 
+\$$$$$$\  $$ /  $$ |$$ |  $$ |    $$ |  \__|$$$$$$$ |$$ /  $$ |$$$$$$$$ |
+ \____$$\ $$ |  $$ |$$ |  $$ |$$\ $$ |     $$  __$$ |$$ |  $$ |$$   ____|
+$$$$$$$  |\$$$$$$  |$$ |  \$$$$  |$$ |     \$$$$$$$ |\$$$$$$$ |\$$$$$$$\ 
+\_______/  \______/ \__|   \____/ \__|      \_______| \_______| \_______|
+""")
+can_run = check_json_state()
+
+# Error catching in case the program is unable to find the properties of the wallet
+try:
+    log_general.info(f"Soltrade has detected {find_balance(config().other_mint)} {config().other_mint_symbol} tokens available for trading.")
+except Exception as e:
+    log_general.error(f"Error finding {config().other_mint_symbol} balance: {e}")
+    exit()
+
+# Checks if the run prompt should be displayed
+if can_run:
+    log_general.debug("Soltrade has successfully imported the API requirements.")
+    start_trading()
+else:
+    exit()
+    
+    
+    
+
+
+
+
+
+wallet.py
+
+import json
+
+from solders.pubkey import Pubkey
+from solana.rpc.types import TokenAccountOpts
+
+from soltrade.utils import handle_rate_limiting
+from soltrade.config import config
+
+
+# Returns the current balance of token in the wallet
+@handle_rate_limiting()
+def find_balance(token_mint):
+    if token_mint == config().sol_mint:
+        balance_response = config().client.get_balance(config().public_address).value
+        balance_response = balance_response / (10 ** 9)
+        return balance_response
+
+    response = config().client.get_token_accounts_by_owner_json_parsed(config().public_address, TokenAccountOpts(
+        mint=Pubkey.from_string(token_mint))).to_json()
+    json_response = json.loads(response)
+    if len(json_response["result"]["value"]) == 0:
+        return 0
+    return json_response["result"]["value"][0]["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"]
+
+
+
+
+
+
+
+
+
+
+
+
+utils.py
+
+import time
+from functools import wraps
+
+from solana.exceptions import SolanaRpcException
+from soltrade.log import log_general
+
+def handle_rate_limiting(retry_attempts=3, retry_delay=10):
+    def decorator(client_function):
+        @wraps(client_function)
+        def wrapper(*args, **kwargs):
+            for _ in range(retry_attempts):
+                try:
+                    return client_function(*args, **kwargs)
+                except SolanaRpcException as e:
+                    if 'HTTPStatusError' in e.error_msg:
+                        log_general.warning(f"Rate limit exceeded in {client_function.__name__}, retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                    else:
+                        raise
+            log_general.warning("Rate limit error persisting, skipping this iteration.")
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+transactions.py
+
+import httpx
+import json
+
+import base64
+from solana.rpc.types import TxOpts
+from solders.transaction import VersionedTransaction
+from solders.signature import Signature
+from solders import message
+
+from soltrade.log import log_general, log_transaction
+from soltrade.config import config
+
+
+class MarketPosition:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(MarketPosition, cls).__new__(cls)
+            cls._instance._position = False  # Use a different name for the internal attribute
+        return cls._instance
+
+    @property
+    def position(self):
+        return self._instance._position
+
+    @position.setter
+    def position(self, value):
+        self._instance._position = value
+
+
+# Returns the route to be manipulated in createTransaction()
+async def create_exchange(input_amount, input_token_mint):
+    log_transaction.info(f"Creating exchange for {input_amount} {input_token_mint}")
+
+    # Determines what mint address should be used in the api link
+    if input_token_mint == config().usdc_mint:
+        output_token_mint = config().other_mint
+        token_decimals = 10**6  # USDC decimals
+    else:
+        output_token_mint = config().usdc_mint
+        token_decimals = config().decimals
+    
+    # Finds the response and converts it into a readable array
+    api_link = f"https://quote-api.jup.ag/v6/quote?inputMint={input_token_mint}&outputMint={output_token_mint}&amount={int(input_amount * token_decimals)}&slippageBps={config().slippage}"
+    log_transaction.info(f"Soltrade API Link: {api_link}")
+    async with httpx.AsyncClient() as client:
+        response = await client.get(api_link)
+        return response.json()
+
+
+# Returns the swap_transaction to be manipulated in sendTransaction()
+async def create_transaction(quote):
+    log_transaction.info(f"""Soltrade is creating transaction for the following quote: 
+{quote}""")
+
+    # Parameters used for the Jupiter POST request
+    parameters = {
+        "quoteResponse": quote,
+        "userPublicKey": str(config().public_address),
+        "wrapUnwrapSOL": True,
+        "computeUnitPriceMicroLamports": 20 * 14000  # fee of roughly $.04  :shrug:
+    }
+
+    # Returns the JSON parsed response of Jupiter
+    async with httpx.AsyncClient() as client:
+        response = await client.post("https://quote-api.jup.ag/v6/swap", json=parameters)
+        return response.json()
+
+
+# Deserializes and sends the transaction from the swap information given
+def send_transaction(swap_transaction, opts):
+    raw_txn = VersionedTransaction.from_bytes(base64.b64decode(swap_transaction))
+    signature = config().keypair.sign_message(message.to_bytes_versioned(raw_txn.message))
+    signed_txn = VersionedTransaction.populate(raw_txn.message, [signature])
+
+    result = config().client.send_raw_transaction(bytes(signed_txn), opts)
+    txid = result.value
+    log_transaction.info(f"Soltrade TxID: {txid}")
+    return txid
+
+def validate_transaction(txid):
+    json_response = config().client.get_signature_statuses([Signature.from_string(txid)]).to_json()
+    parsed_response = json.loads(json_response)
+    status = parsed_response["result"]["value"][0]
+    return status
+
+# Uses the previous functions and parameters to exchange Solana token currencies
+async def perform_swap(sent_amount, sent_token_mint):
+    global position
+    log_general.info("Soltrade is taking a market position.")
+    try:
+        quote = await create_exchange(sent_amount, sent_token_mint)
+        trans = await create_transaction(quote)
+        opts = TxOpts(skip_preflight=True, max_retries=3)
+        txid = send_transaction(trans["swapTransaction"], opts)
+
+        if validate_transaction(txid) == None:
+            for i in range(0,2): # TODO: make this a customizable retry variable in config.json
+                quote = await create_exchange(sent_amount, sent_token_mint)
+                trans = await create_transaction(quote)
+                opts = TxOpts(skip_preflight=True, max_retries=3)
+                txid_attempt = send_transaction(trans["swapTransaction"], opts)
+
+                if validate_transaction(txid_attempt) != None:
+                    break
+            log_transaction.error("Soltrade was unable to take a market position.")
+            return
+
+        if sent_token_mint == config().usdc_mint:
+            decimals = config().decimals
+            bought_amount = int(quote['outAmount']) / decimals
+            log_transaction.info(f"Sold {sent_amount} USDC for {bought_amount:.6f} {config().other_mint_symbol}")
+        else:
+            usdc_decimals = 10**6 # TODO: make this a constant variable in utils.py
+            bought_amount = int(quote['outAmount']) / usdc_decimals
+            log_transaction.info(f"Sold {sent_amount} {config().other_mint_symbol} for {bought_amount:.2f} USDC")
+
+        MarketPosition().position = sent_token_mint == config().usdc_mint
+    except Exception as e:
+        log_transaction.error("Soltrade was unable to take a market position.")
+        log_transaction.error(f"SoltradeException: {e}")
+
+
+
+
+
+
+
+
+
+
+
+trading.py
+
+import requests
+import asyncio
+import pandas as pd
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from soltrade.transactions import perform_swap, MarketPosition
+from soltrade.indicators import calculate_ema, calculate_rsi, calculate_bbands
+from soltrade.wallet import find_balance
+from soltrade.log import log_general, log_transaction
+from soltrade.config import config
+
+
+# Stoploss and trading values for statistics and algorithm
+stoploss = takeprofit = 0
+ema_short = ema_medium = 0
+upper_bb = lower_bb = 0
+rsi = 0
+price = 0
+
+
+# Pulls the candlestick information in fifteen minute intervals
+def fetch_candlestick():
+    url = "https://min-api.cryptocompare.com/data/v2/histominute"
+    headers = {'authorization': config().api_key}
+    params = {'fsym': config().other_mint_symbol, 'tsym': 'USD', 'limit': 50, 'aggregate': config().trading_interval_minutes}
+    response = requests.get(url, headers=headers, params=params)
+    if response.json().get('Response') == 'Error':
+        log_general.error(response.json().get('Message'))
+        exit()
+    return response.json()
+
+
+# Analyzes the current market variables and determines trades
+def perform_analysis():
+    log_general.debug("Soltrade is analyzing the market; no trade has been executed.")
+
+    global stoploss
+    global takeprofit
+    global ema_short, ema_medium
+    global rsi
+    global price
+    global upper_bb, lower_bb
+
+    # Converts JSON response for DataFrame manipulation
+    candle_json = fetch_candlestick()
+    candle_dict = candle_json["Data"]["Data"]
+
+    # Creates DataFrame for manipulation
+    columns = ['close', 'high', 'low', 'open', 'time', 'VF', 'VT']
+    df = pd.DataFrame(candle_dict, columns=columns)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+
+    # DataFrame variable for TA-Lib manipulation
+    cl = df['close']
+
+    # Technical analysis values used in trading algorithm
+    price = cl.iat[-1]
+    ema_short = calculate_ema(dataframe=df, length=5)
+    ema_medium = calculate_ema(dataframe=df, length=20)
+    rsi = calculate_rsi(dataframe=df, length=14)
+    upper_bb, lower_bb = calculate_bbands(dataframe=df, length=14)
+
+    if not MarketPosition().position:
+        usdc_balance = find_balance(config().usdc_mint)
+        input_amount = round(usdc_balance, 1) - 0.01
+        if (ema_short > ema_medium or price < lower_bb.iat[-1]) and rsi <= 31:
+            log_transaction.info("Soltrade has detected a buy signal.")
+            log_transaction.info(get_statistics())
+            if input_amount <= 0 or input_amount >= usdc_balance:
+                log_transaction.info("Soltrade has detected a buy signal, but does not have enough USDC to trade.")
+                return
+            asyncio.run(perform_swap(input_amount, config().usdc_mint))
+            stoploss = cl.iat[-1] * 0.925
+            takeprofit = cl.iat[-1] * 1.25
+    else:
+        input_amount = round(find_balance(config().other_mint), 1) - 0.01
+
+        if price <= stoploss or price >= takeprofit:
+            log_transaction.info("Soltrade has detected a sell signal. Stoploss or takeprofit has been reached.")
+            log_transaction.info(get_statistics())
+            asyncio.run(perform_swap(input_amount, config().other_mint))
+            stoploss = takeprofit = 0
+            return
+
+        if (ema_short < ema_medium or price > upper_bb.iat[-1]) and rsi >= 68:
+            log_transaction.info("Soltrade has detected a sell signal. EMA or BB has been reached.")
+            log_transaction.info(get_statistics())
+            asyncio.run(perform_swap(input_amount, config().other_mint))
+            stoploss = takeprofit = 0
+
+
+# This starts the trading function on a timer
+def start_trading():
+    log_general.info("Soltrade has now initialized the trading algorithm.")
+    log_general.debug("Available commands are /statistics, /pause, /resume, and /quit.")
+
+    trading_sched = BackgroundScheduler()
+    trading_sched.add_job(perform_analysis, 'interval', seconds=config().price_update_seconds, max_instances=1)
+    trading_sched.start()
+    perform_analysis()
+
+    while True:
+        event = input().lower()
+        if event == '/pause':
+            trading_sched.pause()
+            log_general.info("Soltrade has now been paused.")
+
+        if event == '/resume':
+            trading_sched.resume()
+            log_general.info("Soltrade has now been resumed.")
+        if event == '/statistics':
+            print_statistics()
+
+        if event == '/quit':
+            log_general.info("Soltrade has now been shut down.")
+            exit()
+
+
+def get_statistics():
+    return f"""
+
+Short EMA                           {ema_short}
+Medium EMA                          {ema_medium}
+Relative Strength Index             {rsi}
+Price                               {price}
+Upper Bollinger Band                {upper_bb.iat[-1]}
+Lower Bollinger Band                {lower_bb.iat[-1]}"""
+
+
+def print_statistics():
+    log_general.debug(get_statistics())
+    
+    
+    
+
+
+
+
+
+
+
+
+
+
+log.py
+
+import logging
+from logging.handlers import RotatingFileHandler
+from logging import StreamHandler
+import sys
+
+
+# Custom formatter to support colors in console
+class CustomFormatter(logging.Formatter):
+    grey = "\x1b[38;21m"
+    green = "\x1b[32;21m"
+    yellow = "\x1b[33;21m"
+    red = "\x1b[31;21m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    format = "%(asctime)s       %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: grey + format + reset,
+        logging.INFO: green + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: bold_red + format + reset
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
+        return formatter.format(record)
+
+
+class AutoFlushStreamHandler(StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def setup_logger(name, log_file, level=logging.INFO, add_to_general=False):
+    """Function to set up a logger with rotating file handler and console output."""
+    # Formatter without color codes for file output
+    file_formatter = logging.Formatter("%(asctime)s     %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # File handler setup
+    file_handler = RotatingFileHandler(log_file, maxBytes=1000000, backupCount=5)
+    file_handler.setFormatter(file_formatter)
+
+    # Logger setup
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(file_handler)
+
+    # Console handler with color codes
+    console_handler = AutoFlushStreamHandler(sys.stdout)
+    console_handler.setFormatter(CustomFormatter())
+    logger.addHandler(console_handler)
+
+    if add_to_general:
+        general_handler = RotatingFileHandler('general_log.log', maxBytes=1000000, backupCount=5)
+        general_handler.setFormatter(file_formatter)
+        logger.addHandler(general_handler)
+
+    return logger
+
+
+# Creating two loggers, with transaction logger also writing to general log
+log_general = setup_logger('general_logger', 'general_log.log', level=logging.DEBUG)
+log_transaction = setup_logger('transaction_logger', 'transaction_log.log', add_to_general=True, level=logging.DEBUG)
+
+
+
+
+
+
+
+indicators.py
+
+import pandas as pd
+
+
+# Calculates EMA using DataFrame
+def calculate_ema(dataframe: pd.DataFrame, length: int):
+    ema = dataframe['close'].ewm(span=length, adjust=False).mean()
+    return ema.iat[-1]
+
+
+# Calculates BB using SMA indicator and DataFrame
+def calculate_bbands(dataframe: pd.DataFrame, length: int):
+    sma = dataframe['close'].rolling(length).mean()
+    std = dataframe['close'].rolling(length).std()
+    upper_bband = sma + std * 2
+    lower_bband = sma - std * 2
+    return upper_bband, lower_bband
+
+
+# Calculates RSI using custom EMA indicator and DataFrame
+def calculate_rsi(dataframe: pd.DataFrame, length: int):
+    delta = dataframe['close'].diff()
+    up = delta.clip(lower=0)
+    down = delta.clip(upper=0).abs()
+    upper_ema = up.ewm(com=length - 1, adjust=False, min_periods=length).mean()
+    lower_ema = down.ewm(com=length - 1, adjust=False, min_periods=length).mean()
+    rsi = upper_ema / lower_ema
+    rsi = 100 - (100 / (1 + rsi))
+    return rsi.iat[-1]
+
+
+
+
+
+
+
+
+
+config.py
+
+
+import os
+import json
+import base58
+
+from solders.pubkey import Pubkey
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+from soltrade.log import log_general
+
+
+class Config:
+    def __init__(self, path):
+        self.path = path
+        self.api_key = None
+        self.private_key = None
+        self.custom_rpc_https = None
+        self.usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        self.sol_mint = "So11111111111111111111111111111111111111112"
+        self.other_mint = None
+        self.other_mint_symbol = None
+        self.price_update_seconds = None
+        self.trading_interval_minutes = None
+        self.slippage = None  # BPS
+        self.computeUnitPriceMicroLamports = None
+        self.load_config()
+
+    def load_config(self):
+        if not os.path.exists(self.path):
+            log_general.error(
+                "Soltrade was unable to detect the JSON file. Are you sure config.json has not been renamed or removed?")
+            exit(1)
+
+        with open(self.path, 'r') as file:
+            try:
+                config_data = json.load(file)
+                self.api_key = config_data["api_key"]
+                self.private_key = config_data["private_key"]
+                self.custom_rpc_https = config_data.get("custom_rpc_https") or "https://api.mainnet-beta.solana.com/"
+                self.other_mint = config_data.get("other_mint", "")
+                self.other_mint_symbol = config_data.get("other_mint_symbol", "UNKNOWN")
+                self.price_update_seconds = int(config_data.get("price_update_seconds", 60))
+                self.trading_interval_minutes = int(config_data.get("trading_interval_minutes", 1))
+                self.slippage = int(config_data.get("slippage", 50))
+                self.computeUnitPriceMicroLamports = int(config_data.get("computeUnitPriceMicroLamports", 20 * 14000))  # default fee of roughly $.04 today
+            except json.JSONDecodeError as e:
+                log_general.error(f"Error parsing JSON: {e}")
+                exit(1)
+            except KeyError as e:
+                log_general.error(f"Missing configuration key: {e}")
+                exit(1)
+
+    @property
+    def keypair(self):
+        try:
+            return Keypair.from_bytes(base58.b58decode(self.private_key))
+        except Exception as e:
+            log_general.error(f"Error decoding private key: {e}")
+            exit(1)
+
+    @property
+    def public_address(self):
+        return self.keypair.pubkey()
+
+    @property
+    def client(self):
+        rpc_url = self.custom_rpc_https
+        return Client(rpc_url)
+    
+    @property
+    def decimals(self):
+        response = self.client.get_account_info_json_parsed(Pubkey.from_string(config().other_mint)).to_json()
+        json_response = json.loads(response)
+        value = 10**json_response["result"]["value"]["data"]["parsed"]["info"]["decimals"]
+        return value
+
+
+_config_instance = None
+
+
+def config(path=None):
+    global _config_instance
+    if _config_instance is None and path is not None:
+        _config_instance = Config(path)
+    return _config_instance
+
+
+
+
+
+
